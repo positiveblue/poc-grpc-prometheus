@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc"
 
 	pb "github.com/grpc-ecosystem/go-grpc-prometheus/examples/grpc-server-with-prometheus/protobuf"
+	"github.com/grpc-ecosystem/go-grpc-prometheus/packages/grpcstatus"
 	prom "github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -20,30 +21,31 @@ import (
 
 /****
 PROOF OF CONCEPT FOR PROMETHEUS METRICS
-****/
-
-type ServerMetrics struct {
+****/type ServerMetrics struct {
+	labels                 []string
 	serverHandledCounter   *prom.CounterVec
 	serverHandledHistogram *prom.HistogramVec
 }
 
-var SeverMetricLabels = []string{"grpc_service", "grpc_method", "param_name"}
-
-func NewServerMetrics( /*counterOpts ...CounterOption*/ ) *ServerMetrics {
-	//opts := counterOptions(counterOpts)
+// NewServerMetrics returns a ServerMetric which exposes the grpc service metrics for prometheus.
+// SeverMetricLabels should contain the name for the custom labels that we want to attach to all the
+// metrics.
+func NewServerMetrics(labelExtractor LabelExtractor) *ServerMetrics {
+	labels := append([]string{"grpc_service", "grpc_method", "grpc_status"}, labelExtractor.LabelNames()...)
 	return &ServerMetrics{
+		labels: labels,
 		serverHandledCounter: prom.NewCounterVec(
 			prom.CounterOpts{
 				Name: "grpc_server_handled_total",
 				Help: "Total number of RPCs completed on the server, regardless of success or failure.",
-			}, SeverMetricLabels,
+			}, labels,
 		),
 		serverHandledHistogram: prom.NewHistogramVec(
 			prom.HistogramOpts{
 				Name:    "grpc_server_handling_seconds",
 				Help:    "Histogram of response latency (seconds) of gRPC that had been application-level handled by the server.",
 				Buckets: prom.DefBuckets,
-			}, SeverMetricLabels,
+			}, labels,
 		),
 	}
 }
@@ -58,37 +60,32 @@ func (m *ServerMetrics) Collect(ch chan<- prom.Metric) {
 	m.serverHandledHistogram.Collect(ch)
 }
 
-// Casting
-func CustomLabel(v interface{}) string {
-	switch t := v.(type) {
-	case *pb.HelloRequest:
-		return t.Name
-	default:
-		return "unknown"
+// LabelExtractor must extract the needed labels for each one of the metrics and return
+// an array of labels in the SAME ORDER than the ServerMetricLabels used for creating a NewServerMetrics()
+type LabelExtractor interface {
+	LabelNames() []string
+	Labels(context.Context) map[string]string
+}
+
+// DefaultLabelExtractor is a dummy LabelExtractor which returns the empty
+// list when processing the context to get the CustomLabels
+type DefaultLabelExtractor struct{}
+
+// LabelNames returns the names of the extra labels per metric
+func (d *DefaultLabelExtractor) LabelNames() []string {
+	return []string{}
+}
+
+// Labels returns the empty list
+func (d *DefaultLabelExtractor) Labels(ctx context.Context) map[string]string {
+	res := map[string]string{}
+	for _, l := range d.LabelNames() {
+		res[l] = "default"
 	}
+	return res
 }
 
-// UnaryServerInterceptor is a gRPC server-side interceptor that provides Prometheus monitoring for Unary RPCs.
-func (m *ServerMetrics) UnaryServerInterceptor() func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		service, method := splitMethodName(info.FullMethod)
-		fmt.Printf("Type: %T\n", req)
-		fmt.Printf("Value: %v\n", req)
-		monitor := newServerReporter(m, service, method, CustomLabel(req))
-		resp, err := handler(ctx, req)
-		monitor.Handled()
-		return resp, err
-	}
-}
-
-type serverReporter struct {
-	metrics     *ServerMetrics
-	serviceName string
-	methodName  string
-	customLabel string
-	startTime   time.Time
-}
-
+// Method used for spliting the service/method names of a grpc service
 func splitMethodName(fullMethodName string) (string, string) {
 	fullMethodName = strings.TrimPrefix(fullMethodName, "/") // remove leading slash
 	if i := strings.Index(fullMethodName, "/"); i >= 0 {
@@ -97,20 +94,65 @@ func splitMethodName(fullMethodName string) (string, string) {
 	return "unknown", "unknown"
 }
 
-func newServerReporter(m *ServerMetrics, service, method, customLabel string) *serverReporter {
+func (m *ServerMetrics) metricLabels(labelExtractor LabelExtractor, ctx context.Context, info *grpc.UnaryServerInfo) map[string]string {
+	service, method := splitMethodName(info.FullMethod)
+
+	// Populate basic labels
+	labels := map[string]string{
+		"grpc_service": service,
+		"grpc_method":  method,
+	}
+
+	// Populate custom labels
+	for k, v := range labelExtractor.Labels(ctx) {
+		labels[k] = v
+	}
+
+	// Populate non-initialized custom labels with default value
+	for _, labelName := range m.labels {
+		if _, ok := labels[labelName]; !ok {
+			labels[labelName] = "default"
+		}
+	}
+	return labels
+}
+
+// UnaryServerInterceptor is a gRPC server-side interceptor that provides Prometheus monitoring for Unary RPCs.
+func (m *ServerMetrics) UnaryServerInterceptor(labelExtractor LabelExtractor) func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		metricLabels := m.metricLabels(labelExtractor, ctx, info)
+		monitor := newServerReporter(m, metricLabels)
+		resp, err := handler(ctx, req)
+		st, _ := grpcstatus.FromError(err)
+		monitor.labels["grpc_status"] = st.Code().String()
+		monitor.Handled()
+		return resp, err
+	}
+}
+
+type serverReporter struct {
+	metrics   *ServerMetrics
+	labels    map[string]string
+	startTime time.Time
+}
+
+func newServerReporter(m *ServerMetrics, labels map[string]string) *serverReporter {
 	r := &serverReporter{
-		metrics:     m,
-		serviceName: service,
-		methodName:  method,
-		customLabel: customLabel,
-		startTime:   time.Now(),
+		metrics:   m,
+		labels:    labels,
+		startTime: time.Now(),
 	}
 	return r
 }
 
 func (r *serverReporter) Handled() {
-	r.metrics.serverHandledCounter.WithLabelValues(r.serviceName, r.methodName, r.customLabel).Inc()
-	r.metrics.serverHandledHistogram.WithLabelValues(r.serviceName, r.methodName, r.customLabel).Observe(time.Since(r.startTime).Seconds())
+	var orderedLabels []string
+	for _, labelName := range r.metrics.labels {
+		orderedLabels = append(orderedLabels, r.labels[labelName])
+	}
+
+	r.metrics.serverHandledCounter.WithLabelValues(orderedLabels...).Inc()
+	r.metrics.serverHandledHistogram.WithLabelValues(orderedLabels...).Observe(time.Since(r.startTime).Seconds())
 }
 
 /****
@@ -129,15 +171,28 @@ func (s *DemoServiceServer) SayHello(ctx context.Context, request *pb.HelloReque
 	return &pb.HelloResponse{Message: fmt.Sprintf("Hello %s", request.Name)}, nil
 }
 
+type CustomLabelExtractor struct{}
+
+func (d *CustomLabelExtractor) LabelNames() []string {
+	return []string{"userName"}
+}
+
+// Labels returns the empty list
+func (d *CustomLabelExtractor) Labels(ctx context.Context) map[string]string {
+	return map[string]string{"userName": "jordi", "appVersion": "v0.5"}
+}
+
 var (
 	// Create a metrics registry.
 	reg = prom.NewRegistry()
 
+	customLabelExtractor = CustomLabelExtractor{}
+
 	// Create some standard server metrics.
-	grpcMetrics = NewServerMetrics()
+	grpcMetrics = NewServerMetrics(&customLabelExtractor)
 
 	serverInterceptors = []grpc.UnaryServerInterceptor{
-		grpcMetrics.UnaryServerInterceptor(),
+		grpcMetrics.UnaryServerInterceptor(&customLabelExtractor),
 	}
 
 	serverOptions = []grpc.ServerOption{
