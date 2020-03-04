@@ -21,7 +21,8 @@ import (
 
 /****
 PROOF OF CONCEPT FOR PROMETHEUS METRICS
-****/type ServerMetrics struct {
+****/
+type ServerMetrics struct {
 	labels                 []string
 	serverHandledCounter   *prom.CounterVec
 	serverHandledHistogram *prom.HistogramVec
