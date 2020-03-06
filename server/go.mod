@@ -4,7 +4,7 @@ go 1.13
 
 require (
 	github.com/grpc-ecosystem/go-grpc-middleware v1.2.0
-	github.com/grpc-ecosystem/go-grpc-prometheus v1.2.0
+	github.com/grpc-ecosystem/go-grpc-prometheus v1.2.1-0.20191002090509-6af20e3a5340
 	github.com/prometheus/client_golang v1.4.1
 	google.golang.org/grpc v1.27.1
 )
